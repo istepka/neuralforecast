@@ -1,7 +1,4 @@
-
-
-
-__all__ = ['NHITS']
+__all__ = ["NHITS"]
 
 
 from typing import Optional, Tuple
@@ -10,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
 
 from ..common._base_model import BaseModel
 from ..losses.pytorch import MAE
@@ -18,6 +16,7 @@ from ..losses.pytorch import MAE
 class _IdentityBasis(nn.Module):
     def __init__(
         self,
+        backcast_thetas_cnt: int,
         backcast_size: int,
         forecast_size: int,
         interpolation_mode: str,
@@ -28,47 +27,55 @@ class _IdentityBasis(nn.Module):
             "cubic" in interpolation_mode
         )
         self.forecast_size = forecast_size
+        self.backcast_thetas_cnt = backcast_thetas_cnt
         self.backcast_size = backcast_size
         self.interpolation_mode = interpolation_mode
         self.out_features = out_features
 
     def forward(self, theta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # backcast = theta[:, : self.backcast_thetas_cnt]
 
-        backcast = theta[:, : self.backcast_size]
-        knots = theta[:, self.backcast_size :]
+        b_knots = theta[:, : self.backcast_thetas_cnt]
+        f_knots = theta[:, self.backcast_thetas_cnt :]
 
         # Interpolation is performed on default dim=-1 := H
-        knots = knots.reshape(len(knots), self.out_features, -1)
+        f_knots = f_knots.reshape(len(f_knots), self.out_features, -1)
+        b_knots = b_knots.reshape(len(b_knots), self.out_features, -1)
         if self.interpolation_mode in ["nearest", "linear"]:
             # knots = knots[:,None,:]
             forecast = F.interpolate(
-                knots, size=self.forecast_size, mode=self.interpolation_mode
+                f_knots, size=self.forecast_size, mode=self.interpolation_mode
+            )
+            backcast = F.interpolate(
+                b_knots, size=self.backcast_size, mode=self.interpolation_mode
             )
             # forecast = forecast[:,0,:]
         elif "cubic" in self.interpolation_mode:
-            if self.out_features > 1:
-                raise Exception(
-                    "Cubic interpolation not available with multiple outputs."
-                )
-            batch_size = len(backcast)
-            knots = knots[:, None, :, :]
-            forecast = torch.zeros(
-                (len(knots), self.forecast_size), device=knots.device
-            )
-            n_batches = int(np.ceil(len(knots) / batch_size))
-            for i in range(n_batches):
-                forecast_i = F.interpolate(
-                    knots[i * batch_size : (i + 1) * batch_size],
-                    size=self.forecast_size,
-                    mode="bicubic",
-                )
-                forecast[i * batch_size : (i + 1) * batch_size] += forecast_i[
-                    :, 0, 0, :
-                ]  # [B,None,H,H] -> [B,H]
-            forecast = forecast[:, None, :]  # [B,H] -> [B,None,H]
+            raise NotImplementedError("Cubic interpolation is not implemented.")
+            # if self.out_features > 1:
+            #     raise Exception(
+            #         "Cubic interpolation not available with multiple outputs."
+            #     )
+            # batch_size = len(backcast)
+            # knots = knots[:, None, :, :]
+            # forecast = torch.zeros(
+            #     (len(knots), self.forecast_size), device=knots.device
+            # )
+            # n_batches = int(np.ceil(len(knots) / batch_size))
+            # for i in range(n_batches):
+            #     forecast_i = F.interpolate(
+            #         knots[i * batch_size : (i + 1) * batch_size],
+            #         size=self.forecast_size,
+            #         mode="bicubic",
+            #     )
+            #     forecast[i * batch_size : (i + 1) * batch_size] += forecast_i[
+            #         :, 0, 0, :
+            #     ]  # [B,None,H,H] -> [B,H]
+            # forecast = forecast[:, None, :]  # [B,H] -> [B,None,H]
 
         # [B,Q,H] -> [B,H,Q]
         forecast = forecast.permute(0, 2, 1)
+        backcast = backcast.permute(0, 2, 1)
         return backcast, forecast
 
 
@@ -86,7 +93,8 @@ class NHITSBlock(nn.Module):
         self,
         input_size: int,
         h: int,
-        n_theta: int,
+        f_theta: int,
+        b_theta: int,
         mlp_units: list,
         basis: nn.Module,
         futr_input_size: int,
@@ -135,7 +143,9 @@ class NHITSBlock(nn.Module):
                 # raise NotImplementedError('dropout')
                 hidden_layers.append(nn.Dropout(p=self.dropout_prob))
 
-        output_layer = [nn.Linear(in_features=mlp_units[-1][1], out_features=n_theta)]
+        output_layer = [
+            nn.Linear(in_features=mlp_units[-1][1], out_features=b_theta + f_theta)
+        ]
         layers = hidden_layers + output_layer
         self.layers = nn.Sequential(*layers)
         self.basis = basis
@@ -147,7 +157,6 @@ class NHITSBlock(nn.Module):
         hist_exog: torch.Tensor,
         stat_exog: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         # Pooling
         # Pool1d needs 3D input, (B,C,L), adding C dimension
         insample_y = insample_y.unsqueeze(1)
@@ -285,7 +294,6 @@ class NHITS(BaseModel):
         dataloader_kwargs=None,
         **trainer_kwargs,
     ):
-
         # Inherit BaseWindows class
         super(NHITS, self).__init__(
             h=h,
@@ -339,6 +347,8 @@ class NHITS(BaseModel):
         )
         self.blocks = torch.nn.ModuleList(blocks)
 
+        self.debugging = False
+
     def create_stack(
         self,
         h,
@@ -356,19 +366,20 @@ class NHITS(BaseModel):
         hist_input_size,
         stat_input_size,
     ):
-
         block_list = []
         for i in range(len(stack_types)):
             for block_id in range(n_blocks[i]):
+                assert stack_types[i] == "identity", (
+                    f"Block type {stack_types[i]} not found!"
+                )
 
-                assert (
-                    stack_types[i] == "identity"
-                ), f"Block type {stack_types[i]} not found!"
-
-                n_theta = input_size + self.loss.outputsize_multiplier * max(
+                back_theta = max(input_size // n_freq_downsample[i], 1)
+                f_theta = self.loss.outputsize_multiplier * max(
                     h // n_freq_downsample[i], 1
                 )
+                n_theta = back_theta + f_theta
                 basis = _IdentityBasis(
+                    backcast_thetas_cnt=back_theta,
                     backcast_size=input_size,
                     forecast_size=h,
                     out_features=self.loss.outputsize_multiplier,
@@ -381,7 +392,8 @@ class NHITS(BaseModel):
                     futr_input_size=futr_input_size,
                     hist_input_size=hist_input_size,
                     stat_input_size=stat_input_size,
-                    n_theta=n_theta,
+                    f_theta=f_theta,
+                    b_theta=back_theta,
                     mlp_units=mlp_units,
                     n_pool_kernel_size=n_pool_kernel_size[i],
                     pooling_mode=pooling_mode,
@@ -396,7 +408,6 @@ class NHITS(BaseModel):
         return block_list
 
     def forward(self, windows_batch):
-
         # Parse windows_batch
         insample_y = windows_batch["insample_y"].squeeze(-1).contiguous()
         insample_mask = windows_batch["insample_mask"].squeeze(-1).contiguous()
@@ -404,9 +415,13 @@ class NHITS(BaseModel):
         hist_exog = windows_batch["hist_exog"]
         stat_exog = windows_batch["stat_exog"]
 
+        # print(
+        #     f"insample_y shape: {insample_y.shape}, mean: {insample_y.mean()}, std: {insample_y.std()}"
+        # )
+
         # insample
-        residuals = insample_y.flip(dims=(-1,))  # backcast init
-        insample_mask = insample_mask.flip(dims=(-1,))
+        residuals = insample_y  # .flip(dims=(-1,))  # backcast init
+        insample_mask = insample_mask  # .flip(dims=(-1,))
 
         forecast = insample_y[:, -1:, None]  # Level with Naive1
         block_forecasts = [forecast.repeat(1, self.h, 1)]
@@ -417,8 +432,19 @@ class NHITS(BaseModel):
                 hist_exog=hist_exog,
                 stat_exog=stat_exog,
             )
+            backcast = backcast.squeeze()
             residuals = (residuals - backcast) * insample_mask
             forecast = forecast + block_forecast
+
+            if self.debugging:
+                cwd = os.getcwd()
+                backcast_path = os.path.join(cwd, f"backcast_block_{i}.pt")
+                torch.save(backcast, backcast_path)
+                block_forecast_path = os.path.join(cwd, f"block_forecast_block_{i}.pt")
+                torch.save(block_forecast, block_forecast_path)
+                residuals_path = os.path.join(cwd, f"residuals_block_{i}.pt")
+                torch.save(residuals, residuals_path)
+                print(f"Saved debugging tensors for block {i} in {cwd}")
 
             if self.decompose_forecast:
                 block_forecasts.append(block_forecast)
